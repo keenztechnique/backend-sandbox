@@ -11,6 +11,11 @@ class TaskModel(Base):
   email: Mapped[str] = mapped_column(String(255), nullable=False)
   message: Mapped[str] = mapped_column(Text, nullable=False)
   status: Mapped[str] = mapped_column(String(50), default="pending")
+
+  # Убираем tzinfo, чтобы дата подходила под TIMESTAMP WITHOUT TIME ZONE
   created_at: Mapped[datetime.datetime] = mapped_column(
-      DateTime, default=datetime.datetime.utcnow
+      DateTime,
+      default=lambda: datetime.datetime.now(datetime.timezone.utc).replace(
+          tzinfo=None
+      ),
   )

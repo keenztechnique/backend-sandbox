@@ -3,7 +3,7 @@ import aio_pika
 from database import Base, engine, get_db
 from fastapi import Depends, FastAPI, HTTPException
 from models import TaskModel
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 import datetime
 from sqlalchemy import select
@@ -38,7 +38,6 @@ class TaskSchema(BaseModel):
   message: str
 
 
-# Схема для ответа с информацией о задаче
 class TaskResponseSchema(BaseModel):
   id: int
   email: str
@@ -46,10 +45,8 @@ class TaskResponseSchema(BaseModel):
   status: str
   created_at: datetime.datetime
 
-  class Config:
-    from_attributes = (  # Позволяет Pydantic читать данные напрямую из моделей SQLAlchemy
-        True
-    )
+  # Современный стандарт Pydantic v2 вместо class Config
+  model_config = ConfigDict(from_attributes=True)
 
 
 @app.post("/send-task/")
@@ -63,7 +60,7 @@ async def send_task_to_queue(task: TaskSchema, db: AsyncSession = Depends(get_db
     # 1. Сохраняем задачу в PostgreSQL через SQLAlchemy сессию
     db_task = TaskModel(email=task.email, message=task.message, status="pending")
     db.add(db_task)
-    await db.commit()
+    await db.flush()  # Фиксируем изменения в памяти сессии, получая ID без жесткого commit
     await db.refresh(db_task)
 
     # 2. Публикуем задачу в RabbitMQ
