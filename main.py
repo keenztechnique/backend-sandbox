@@ -14,20 +14,13 @@ rabbit_connection = None
 async def lifespan(app: FastAPI):
   global rabbit_connection
 
-  # 1. Создаем таблицы в БД автоматически
-  print("🛠 Создание таблиц в базе данных...")
-  async with engine.begin() as conn:
-    await conn.run_sync(Base.metadata.create_all)
-  print(" Таблицы успешно созданы!")
-
-  # 2. Подключаемся к RabbitMQ
+  # Подключаемся к RabbitMQ (создание таблиц убрано, теперь это делает Alembic)
   print(" Подключение к RabbitMQ...")
   rabbit_connection = await aio_pika.connect("amqp://guest:guest@localhost/")
   print(" Успешно подключено к RabbitMQ!")
 
   yield
 
-  # 3. Закрытие соединения при выключении
   print(" Закрытие соединения с RabbitMQ...")
   if rabbit_connection:
     await rabbit_connection.close()
