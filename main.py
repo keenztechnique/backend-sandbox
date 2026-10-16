@@ -5,6 +5,8 @@ from fastapi import Depends, FastAPI, HTTPException
 from models import TaskModel
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
+import datetime
+from sqlalchemy import select
 
 # Глобальная переменная для соединения с брокером
 rabbit_connection = None
@@ -30,10 +32,24 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Backend Sandbox - DB & RabbitMQ", lifespan=lifespan)
 
 
-# Схема данных для входящего POST-запроса
+# Схема для входящего POST-запроса
 class TaskSchema(BaseModel):
   email: str
   message: str
+
+
+# Схема для ответа с информацией о задаче
+class TaskResponseSchema(BaseModel):
+  id: int
+  email: str
+  message: str
+  status: str
+  created_at: datetime.datetime
+
+  class Config:
+    from_attributes = (  # Позволяет Pydantic читать данные напрямую из моделей SQLAlchemy
+        True
+    )
 
 
 @app.post("/send-task/")
@@ -78,3 +94,15 @@ async def send_task_to_queue(task: TaskSchema, db: AsyncSession = Depends(get_db
     raise HTTPException(
         status_code=500, detail=f"Ошибка при обработке задачи: {str(e)}"
     )
+
+@app.get("/tasks/{task_id}", response_model=TaskResponseSchema)
+async def get_task_status(task_id: int, db: AsyncSession = Depends(get_db)):
+  # Выполняем асинхронный запрос к таблице tasks
+  result = await db.execute(select(TaskModel).where(TaskModel.id == task_id))
+  task = result.scalars().first()
+
+  # Если задача не найдена, возвращаем 404
+  if not task:
+    raise HTTPException(status_code=404, detail=f"Задача с ID #{task_id} не найдена")
+
+  return task
