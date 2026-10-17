@@ -1,81 +1,105 @@
 # worker.py
 import asyncio
-from aio_pika import IncomingMessage, connect
-from database import async_session_maker
-from models import TaskModel
-from sqlalchemy import select
+from aio_pika import ExchangeType, IncomingMessage, Message, connect
 
 
 async def process_task(message: IncomingMessage):
-  async with message.process():
+  # Получаем информацию о количестве неудачных попыток из заголовков x-death
+  headers = message.headers or {}
+  x_death = headers.get("x-death")
+
+  retry_count = 0
+  if x_death:
+    # x-death хранит историю пересылок сообщения между очередями
+    retry_count = x_death[0].get("count", 0)
+
+  max_retries = 3  # максимальное число попыток
+
+  print(
+      f" [x] Получено сообщение. Попытка №{retry_count + 1} (из {max_retries})"
+  )
+
+  try:
     body = message.body.decode()
-    print(f" [x] Получено сырое сообщение: {body}")
+    print(f" [x] Текст задачи: {body}")
 
-    # Ожидаемый формат сообщения от FastAPI: "TaskID: 1, Email: ..., Text: ..."
-    # Вытащим оттуда Task ID для работы с базой данных
-    try:
-      task_id_str = body.split(",")[0].replace("TaskID:", "").strip()
-      task_id = int(task_id_str)
-    except Exception as e:
-      print(f" [!] Ошибка парсинга ID задачи: {e}")
-      return
+    # Имитируем работу (и иногда намеренно вызываем сбой для теста)
+    await asyncio.sleep(2)
 
-    # Открываем сессию базы данных внутри воркера (паттерн Unit of Work)
-    async with async_session_maker() as session:
-      async with session.begin():
-        # 1. Находим задачу в БД по ID
-        result = await session.execute(
-            select(TaskModel).where(TaskModel.id == task_id)
-        )
-        task = result.scalars().first()
+    # Демонстрация ошибки: если текст содержит "error", падаем
+    if "error" in body.lower():
+      raise ValueError("Искусственная ошибка обработки задачи!")
 
-        if not task:
-          print(f" [!] Задача с ID {task_id} не найдена в базе данных!")
-          return
+    # Если всё успешно, подтверждаем сообщение (ACK)
+    await message.ack()
+    print(" [✔] Задача успешно выполнена!")
 
-        # 2. Меняем статус на 'processing' (в работе)
-        task.status = "processing"
-        await session.commit()
-        print(f" [⚙️] Задача #{task_id} взята в работу (статус: processing)")
+  except Exception as e:
+    print(f" [!] Ошибка при обработке: {e}")
 
-      # Имитируем долгую фоновую работу (например, отправку письма или тяжелые вычисления)
-      await asyncio.sleep(4)
-
-      async with session.begin():
-        # Повторно затягиваем объект в новую транзакцию для обновления статуса
-        result = await session.execute(
-            select(TaskModel).where(TaskModel.id == task_id)
-        )
-        task = result.scalars().first()
-
-        if task:
-          # 3. Меняем статус на 'completed' (выполнено)
-          task.status = "completed"
-          await session.commit()
-          print(
-              f" [✔] Задача #{task_id} успешно выполнена и обновлена в БД!"
-          )
+    if retry_count < max_retries:
+      # Отклоняем сообщение без возврата в текущую очередь (requeue=False).
+      # Оно автоматически полетит в DLX (очередь повтора с задержкой).
+      await message.nack(requeue=False)
+      print(
+          f" [🔄] Ошибка временная. Сообщение отправлено на повтор (попытка"
+          f" {retry_count + 1}/{max_retries})"
+      )
+    else:
+      # Превышен лимит попыток — отправляем в Dead Letter Queue навсегда (или сбрасываем)
+      # Здесь можно отправить в отдельную очередь финальных ошибок
+      await message.reject(requeue=False)
+      print(
+          " [❌] Превышен лимит попыток! Сообщение отправлено в Dead Letter"
+          " Queue."
+      )
 
 
 async def main():
-  # Подключаемся к RabbitMQ
   connection = await connect("amqp://guest:guest@localhost/")
   channel = await connection.channel()
 
-  # Ограничиваем QoS: один воркер берет строго по 1 сообщению за раз
   await channel.set_qos(prefetch_count=1)
 
-  # Подписываемся на очередь
-  queue = await channel.declare_queue("notification_queue", durable=True)
-  print(
-      " [*] Воркер с поддержкой БД запущен и ожидает задачи. Для выхода нажмите"
-      " CTRL+C"
+  # 1. Объявляем обменник для повторных попыток (Retry Exchange)
+  retry_exchange = await channel.declare_exchange(
+      "notification_retry_exchange", ExchangeType.DIRECT, durable=True
   )
 
-  # Запускаем прослушивание очереди
+  # 2. Объявляем основную точку обмена
+  main_exchange = await channel.declare_exchange(
+      "notification_exchange", ExchangeType.DIRECT, durable=True
+  )
+
+  # 3. Объявляем очередь повтора (Retry Queue) с задержкой (TTL = 5000 мс / 5 секунд)
+  # Когда время истекает, сообщение возвращается обратно в main_exchange
+  retry_queue = await channel.declare_queue(
+      "notification_retry_queue",
+      durable=True,
+      arguments={
+          "x-message-ttl": 5000,  # Задержка перед повтором в миллисекундах (5 сек)
+          "x-dead-letter-exchange": "notification_exchange",  #Куда отправить после TTL
+          "x-dead-letter-routing-key": "notification_routing_key",
+      },
+  )
+  await retry_queue.bind(retry_exchange, routing_key="retry_routing_key")
+
+  # 4. Объявляем основную очередь задач (Notification Queue) с привязкой DLX
+  # Если сообщение отклонено (nack с requeue=False), оно улетает в notification_retry_exchange
+  queue = await channel.declare_queue(
+      "notification_queue",
+      durable=True,
+      arguments={
+          "x-dead-letter-exchange": "notification_retry_exchange",
+          "x-dead-letter-routing-key": "retry_routing_key",
+      },
+  )
+  await queue.bind(main_exchange, routing_key="notification_routing_key")
+
+  print(" [*] Воркер с поддержкой Retry/DLX запущен и ожидает задачи...")
+
   await queue.consume(process_task)
 
-  # Держим процесс запущенным
   try:
     await asyncio.Future()
   finally:

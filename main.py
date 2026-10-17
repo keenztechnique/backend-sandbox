@@ -63,21 +63,27 @@ async def send_task_to_queue(task: TaskSchema, db: AsyncSession = Depends(get_db
     await db.flush()  # Фиксируем изменения в памяти сессии, получая ID без жесткого commit
     await db.refresh(db_task)
 
-    # 2. Публикуем задачу в RabbitMQ
+    # 2. Публикуем задачу в RabbitMQ через наш кастомный обменник (Exchange)
     async with rabbit_connection.channel() as channel:
-      queue_name = "notification_queue"
-      await channel.declare_queue(queue_name, durable=True)
+      exchange_name = "notification_exchange"
+      routing_key = "notification_routing_key"
+
+      # Объявляем обменник (на всякий случай, если воркер еще не поднялся)
+      exchange = await channel.declare_exchange(
+          exchange_name, aio_pika.ExchangeType.DIRECT, durable=True
+      )
 
       message_body = (
           f"TaskID: {db_task.id}, Email: {task.email}, Text: {task.message}".encode()
       )
 
-      await channel.default_exchange.publish(
+      # Публикуем сообщение в обменник
+      await exchange.publish(
           aio_pika.Message(
               body=message_body,
               delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
           ),
-          routing_key=queue_name,
+          routing_key=routing_key,
       )
 
     return {
