@@ -7,10 +7,16 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 import datetime
 from sqlalchemy import select
+import time
+from fastapi import FastAPI, Request
+import structlog
+from logger import setup_logging
 
 # Глобальная переменная для соединения с брокером
 rabbit_connection = None
 
+setup_logging()
+logger = structlog.get_logger()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -109,3 +115,22 @@ async def get_task_status(task_id: int, db: AsyncSession = Depends(get_db)):
     raise HTTPException(status_code=404, detail=f"Задача с ID #{task_id} не найдена")
 
   return task
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+  start_time = time.time()
+  logger.info(
+      "incoming_request", method=request.method, path=request.url.path
+  )
+
+  response = await call_next(request)
+
+  process_time = (time.time() - start_time) * 1000
+  logger.info(
+      "request_processed",
+      method=request.method,
+      path=request.url.path,
+      status_code=response.status_code,
+      duration_ms=round(process_time, 2),
+  )
+  return response

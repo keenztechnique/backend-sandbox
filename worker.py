@@ -1,6 +1,13 @@
 # worker.py
 import asyncio
-from aio_pika import ExchangeType, IncomingMessage, Message, connect
+import json
+import structlog
+from aio_pika import ExchangeType, IncomingMessage, connect
+from logger import setup_logging
+
+# Инициализируем структурированное логирование
+setup_logging()
+logger = structlog.get_logger()
 
 
 async def process_task(message: IncomingMessage):
@@ -10,48 +17,69 @@ async def process_task(message: IncomingMessage):
 
   retry_count = 0
   if x_death:
-    # x-death хранит историю пересылок сообщения между очередями
     retry_count = x_death[0].get("count", 0)
 
   max_retries = 3  # максимальное число попыток
+  attempt_num = retry_count + 1
 
-  print(
-      f" [x] Получено сообщение. Попытка №{retry_count + 1} (из {max_retries})"
+  # Декодируем тело сообщения заранее, чтобы попытаться достать task_id/email для логов
+  try:
+    body_text = message.body.decode()
+    body_data = json.loads(body_text)
+    task_id = body_data.get("id") or body_data.get("task_id")
+    email = body_data.get("email")
+  except Exception:
+    body_text = message.body.decode()
+    task_id = None
+    email = None
+
+  logger.info(
+      "task_received_in_worker",
+      attempt=attempt_num,
+      max_retries=max_retries,
+      task_id=task_id,
+      email=email,
+      body=body_text,
   )
 
   try:
-    body = message.body.decode()
-    print(f" [x] Текст задачи: {body}")
-
     # Имитируем работу (и иногда намеренно вызываем сбой для теста)
     await asyncio.sleep(2)
 
     # Демонстрация ошибки: если текст содержит "error", падаем
-    if "error" in body.lower():
+    if "error" in body_text.lower():
       raise ValueError("Искусственная ошибка обработки задачи!")
 
     # Если всё успешно, подтверждаем сообщение (ACK)
     await message.ack()
-    print(" [✔] Задача успешно выполнена!")
+    logger.info("task_completed_successfully", task_id=task_id)
 
   except Exception as e:
-    print(f" [!] Ошибка при обработке: {e}")
+    logger.error(
+        "task_processing_failed",
+        task_id=task_id,
+        attempt=attempt_num,
+        error=str(e),
+        exc_info=True,
+    )
 
     if retry_count < max_retries:
       # Отклоняем сообщение без возврата в текущую очередь (requeue=False).
       # Оно автоматически полетит в DLX (очередь повтора с задержкой).
       await message.nack(requeue=False)
-      print(
-          f" [🔄] Ошибка временная. Сообщение отправлено на повтор (попытка"
-          f" {retry_count + 1}/{max_retries})"
+      logger.warning(
+          "task_scheduled_for_retry",
+          task_id=task_id,
+          next_attempt=attempt_num + 1,
+          max_retries=max_retries,
       )
     else:
-      # Превышен лимит попыток — отправляем в Dead Letter Queue навсегда (или сбрасываем)
-      # Здесь можно отправить в отдельную очередь финальных ошибок
+      # Превышен лимит попыток — отправляем в Dead Letter Queue навсегда
       await message.reject(requeue=False)
-      print(
-          " [❌] Превышен лимит попыток! Сообщение отправлено в Dead Letter"
-          " Queue."
+      logger.error(
+          "task_retries_exhausted_sent_to_dlq",
+          task_id=task_id,
+          max_retries=max_retries,
       )
 
 
@@ -72,20 +100,18 @@ async def main():
   )
 
   # 3. Объявляем очередь повтора (Retry Queue) с задержкой (TTL = 5000 мс / 5 секунд)
-  # Когда время истекает, сообщение возвращается обратно в main_exchange
   retry_queue = await channel.declare_queue(
       "notification_retry_queue",
       durable=True,
       arguments={
-          "x-message-ttl": 5000,  # Задержка перед повтором в миллисекундах (5 сек)
-          "x-dead-letter-exchange": "notification_exchange",  #Куда отправить после TTL
+          "x-message-ttl": 5000,
+          "x-dead-letter-exchange": "notification_exchange",
           "x-dead-letter-routing-key": "notification_routing_key",
       },
   )
   await retry_queue.bind(retry_exchange, routing_key="retry_routing_key")
 
   # 4. Объявляем основную очередь задач (Notification Queue) с привязкой DLX
-  # Если сообщение отклонено (nack с requeue=False), оно улетает в notification_retry_exchange
   queue = await channel.declare_queue(
       "notification_queue",
       durable=True,
@@ -96,7 +122,7 @@ async def main():
   )
   await queue.bind(main_exchange, routing_key="notification_routing_key")
 
-  print(" [*] Воркер с поддержкой Retry/DLX запущен и ожидает задачи...")
+  logger.info("worker_started_waiting_for_messages")
 
   await queue.consume(process_task)
 
