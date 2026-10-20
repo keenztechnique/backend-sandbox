@@ -4,9 +4,14 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
+import os
 
-# Строка подключения к PostgreSQL (используем наш контейнер)
-DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/sandbox_db"
+# Станет так: если переменная окружения задана (в Docker), возьмет её. 
+# Если нет (при локальном запуске), подставит localhost по умолчанию.
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", 
+    "postgresql+asyncpg://postgres:postgres@localhost:5432/backend_sandbox"
+)
 
 # Создаем асинхронный движок
 engine = create_async_engine(DATABASE_URL, echo=True)
