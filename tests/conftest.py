@@ -1,4 +1,9 @@
 # tests/conftest.py
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).parent.parent))
+
 from unittest.mock import AsyncMock, MagicMock
 from database import Base, engine, get_db
 from httpx import ASGITransport, AsyncClient
